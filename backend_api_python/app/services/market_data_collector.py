@@ -15,12 +15,35 @@
 """
 
 import time
+import os
+import sys
+import json
+import argparse
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 import yfinance as yf
 import pandas as pd
+
+# 本地直跑时，优先加载 .env，确保 API keys 可用
+try:
+    from dotenv import load_dotenv
+    _this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _backend_root_dir = os.path.dirname(os.path.dirname(_this_file_dir))
+    _repo_root_dir = os.path.dirname(_backend_root_dir)
+    load_dotenv(os.path.join(_backend_root_dir, ".env"), override=False)
+    load_dotenv(os.path.join(_repo_root_dir, ".env"), override=False)
+except Exception:
+    # python-dotenv 可选，不影响系统环境变量注入
+    pass
+
+# 支持直接执行该文件：自动补齐 backend_api_python 到 sys.path
+if __package__ in (None, ""):
+    _this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _backend_root_dir = os.path.dirname(os.path.dirname(_this_file_dir))
+    if _backend_root_dir not in sys.path:
+        sys.path.insert(0, _backend_root_dir)
 
 from app.data_sources import DataSourceFactory
 from app.services.kline import KlineService
@@ -1335,3 +1358,34 @@ def get_market_data_collector() -> MarketDataCollector:
     if _collector is None:
         _collector = MarketDataCollector()
     return _collector
+
+
+def main() -> None:
+    """本地调试入口：采集单个标的市场数据并输出 JSON。"""
+    parser = argparse.ArgumentParser(description="Collect market data for local debugging")
+    parser.add_argument("market", nargs="?", default="USStock", help="Market type, default: USStock")
+    parser.add_argument("symbol", nargs="?", default="AAPL", help="Symbol, default: AAPL")
+    parser.add_argument("--timeframe", default="1D", help="K-line timeframe, default: 1D")
+    parser.add_argument("--timeout", type=int, default=30, help="Total timeout seconds")
+    parser.add_argument("--no-macro", action="store_true", help="Disable macro data collection")
+    parser.add_argument("--no-news", action="store_true", help="Disable news collection")
+    parser.add_argument("--no-polymarket", action="store_true", help="Disable polymarket collection")
+    args = parser.parse_args()
+
+    logger.info(f"Local debug run: market={args.market}, symbol={args.symbol}, timeframe={args.timeframe}")
+
+    collector = MarketDataCollector()
+    result = collector.collect_all(
+        market=args.market,
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        include_macro=not args.no_macro,
+        include_news=not args.no_news,
+        include_polymarket=not args.no_polymarket,
+        timeout=args.timeout,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

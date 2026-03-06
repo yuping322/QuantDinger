@@ -8,10 +8,33 @@ Fast Analysis Service 3.0
 3. 多维新闻 - 使用结构化API，无需深度阅读
 4. 单次LLM调用 - 强约束prompt，输出结构化分析
 """
+import os
+import sys
 import json
 import time
+import argparse
 from typing import Dict, Any, Optional, List
 from decimal import Decimal, ROUND_HALF_UP
+
+
+# 本地直跑时，优先加载 .env，确保 API keys 可用
+try:
+    from dotenv import load_dotenv
+    _this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _backend_root_dir = os.path.dirname(os.path.dirname(_this_file_dir))
+    _repo_root_dir = os.path.dirname(_backend_root_dir)
+    load_dotenv(os.path.join(_backend_root_dir, ".env"), override=False)
+    load_dotenv(os.path.join(_repo_root_dir, ".env"), override=False)
+except Exception:
+    # python-dotenv 可选，不影响系统环境变量注入
+    pass
+
+# 支持直接执行该文件：自动补齐 backend_api_python 到 sys.path
+if __package__ in (None, ""):
+    _this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _backend_root_dir = os.path.dirname(os.path.dirname(_this_file_dir))
+    if _backend_root_dir not in sys.path:
+        sys.path.insert(0, _backend_root_dir)
 
 from app.utils.logger import get_logger
 from app.services.llm import LLMService
@@ -1790,3 +1813,32 @@ def fast_analyze(market: str, symbol: str, language: str = 'en-US',
     """Convenience function for fast analysis."""
     service = get_fast_analysis_service()
     return service.analyze(market, symbol, language, model, timeframe)
+
+
+def main() -> None:
+    """本地调试入口：执行一次 fast analysis。"""
+    parser = argparse.ArgumentParser(description="Run one-shot fast analysis")
+    parser.add_argument("market", nargs="?", default="USStock", help="Market type, default: USStock")
+    parser.add_argument("symbol", nargs="?", default="AAPL", help="Symbol, default: AAPL")
+    parser.add_argument("--language", default="zh-CN", help="Response language, default: zh-CN")
+    parser.add_argument("--model", default=None, help="Optional model override")
+    parser.add_argument("--timeframe", default="1D", help="Analysis timeframe, default: 1D")
+    args = parser.parse_args()
+
+    logger.info(
+        f"Local fast-analysis run: market={args.market}, symbol={args.symbol}, "
+        f"timeframe={args.timeframe}, language={args.language}"
+    )
+
+    result = fast_analyze(
+        market=args.market,
+        symbol=args.symbol,
+        language=args.language,
+        model=args.model,
+        timeframe=args.timeframe,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
