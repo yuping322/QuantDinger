@@ -2,12 +2,23 @@
 Polymarket后台任务
 每30分钟更新一次市场数据，并批量分析市场机会
 """
+import os
+import json
+import argparse
 import threading
 import time
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from datetime import datetime
+from typing import List, Dict, Optional, Any
+
+# 支持直接执行该文件：自动补齐 backend_api_python 到 sys.path
+if __package__ in (None, ""):
+    import sys
+    _this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    _backend_root_dir = os.path.dirname(os.path.dirname(_this_file_dir))
+    if _backend_root_dir not in sys.path:
+        sys.path.insert(0, _backend_root_dir)
+
 from app.utils.logger import get_logger
-from app.utils.db import get_db_connection
 from app.data_sources.polymarket import PolymarketDataSource
 from app.services.polymarket_batch_analyzer import PolymarketBatchAnalyzer
 
@@ -81,80 +92,92 @@ class PolymarketWorker:
         
         logger.info("PolymarketWorker loop stopped")
     
+    def _fetch_unique_markets(self, categories: Optional[List[str]] = None, per_category_limit: int = 50) -> List[Dict[str, Any]]:
+        """从多个分类抓取并按 market_id 去重。"""
+        if categories is None:
+            categories = ["crypto", "politics", "economics", "sports", "tech", "finance", "geopolitics", "culture", "climate", "entertainment"]
+
+        all_markets: List[Dict[str, Any]] = []
+        for category in categories:
+            try:
+                markets = self.polymarket_source.get_trending_markets(category, limit=per_category_limit)
+                all_markets.extend(markets)
+                logger.info(f"Fetched {len(markets)} markets from category: {category}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch markets for category {category}: {e}")
+
+        unique_markets: Dict[str, Dict[str, Any]] = {}
+        for market in all_markets:
+            market_id = market.get('market_id')
+            if market_id:
+                unique_markets[market_id] = market
+
+        logger.info(f"Total unique markets: {len(unique_markets)}")
+        return list(unique_markets.values())
+
+    def _select_rule_based_opportunities(self, markets: List[Dict[str, Any]], max_opportunities: int = 30) -> List[Dict[str, Any]]:
+        """规则筛选高价值机会，减少LLM调用。"""
+        rule_based_opportunities = []
+        for market in markets:
+            prob = market.get('current_probability', 50.0)
+            volume = market.get('volume_24h', 0)
+            divergence = abs(prob - 50.0)
+            if volume > 5000 and divergence > 8:
+                rule_based_opportunities.append(market)
+
+        if not rule_based_opportunities:
+            return []
+
+        rule_based_opportunities.sort(
+            key=lambda x: (x.get('volume_24h', 0) * abs(x.get('current_probability', 50) - 50)),
+            reverse=True
+        )
+        return rule_based_opportunities[:max_opportunities]
+
+    def run_once_analysis(self, categories: Optional[List[str]] = None, per_category_limit: int = 50,
+                          max_opportunities: int = 30, save_to_db: bool = True) -> Dict[str, Any]:
+        """运行一次完整流程：抓取市场 -> 规则筛选 -> LLM分析 -> 可选入库。"""
+        start_time = time.time()
+
+        markets = self._fetch_unique_markets(categories=categories, per_category_limit=per_category_limit)
+        logger.info(f"Starting batch analysis for {len(markets)} markets...")
+
+        opportunities = self._select_rule_based_opportunities(markets, max_opportunities=max_opportunities)
+        if opportunities:
+            logger.info(f"Rule-based filtering: {len(opportunities)} opportunities, analyzing top {len(opportunities)} with LLM")
+            analyzed_markets = self.batch_analyzer.batch_analyze_markets(
+                opportunities,
+                max_opportunities=max_opportunities,
+            )
+        else:
+            logger.info("No rule-based opportunities found, skipping LLM analysis")
+            analyzed_markets = []
+
+        if save_to_db and analyzed_markets:
+            self.batch_analyzer.save_batch_analysis(analyzed_markets)
+
+        elapsed = time.time() - start_time
+        summary = {
+            "markets_fetched": len(markets),
+            "opportunities_selected": len(opportunities),
+            "opportunities_analyzed": len(analyzed_markets),
+            "saved_to_db": bool(save_to_db and analyzed_markets),
+            "elapsed_seconds": round(elapsed, 2),
+            "ran_at": datetime.utcnow().isoformat() + "Z",
+        }
+        logger.info(
+            f"Polymarket run-once completed: fetched={summary['markets_fetched']}, "
+            f"selected={summary['opportunities_selected']}, analyzed={summary['opportunities_analyzed']}, "
+            f"elapsed={summary['elapsed_seconds']}s"
+        )
+        self._last_update_ts = time.time()
+        return summary
+
     def _update_markets_and_analyze(self) -> None:
-        """更新市场数据并分析"""
+        """更新市场数据并分析（后台循环复用 run_once 核心逻辑）。"""
         try:
             logger.info("Starting Polymarket data update and analysis...")
-            start_time = time.time()
-            
-            # 1. 更新市场数据（从所有主要分类获取）
-            categories = ["crypto", "politics", "economics", "sports", "tech", "finance", "geopolitics", "culture", "climate", "entertainment"]
-            all_markets = []
-            
-            for category in categories:
-                try:
-                    markets = self.polymarket_source.get_trending_markets(category, limit=50)
-                    all_markets.extend(markets)
-                    logger.info(f"Fetched {len(markets)} markets from category: {category}")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch markets for category {category}: {e}")
-            
-            # 去重（按market_id）
-            unique_markets = {}
-            for market in all_markets:
-                market_id = market.get('market_id')
-                if market_id:
-                    unique_markets[market_id] = market
-            
-            logger.info(f"Total unique markets: {len(unique_markets)}")
-            
-            # 2. 批量分析市场（一次性分析所有市场，由AI筛选机会）
-            markets_list = list(unique_markets.values())
-            logger.info(f"Starting batch analysis for {len(markets_list)} markets...")
-            
-            # 优化策略：先用规则筛选，只对高价值机会调用LLM
-            # 这样可以大幅减少LLM调用次数，节省token
-            
-            # 1. 先用规则筛选出最有价值的机会（不调用LLM）
-            rule_based_opportunities = []
-            for market in markets_list:
-                prob = market.get('current_probability', 50.0)
-                volume = market.get('volume_24h', 0)
-                divergence = abs(prob - 50.0)
-                
-                # 规则筛选：高交易量 + 明显概率偏差
-                if volume > 5000 and divergence > 8:
-                    rule_based_opportunities.append(market)
-            
-            # 2. 只对规则筛选出的机会调用LLM（最多30个，节省token）
-            if rule_based_opportunities:
-                logger.info(f"Rule-based filtering: {len(rule_based_opportunities)} opportunities, analyzing top 30 with LLM")
-                # 按交易量和概率偏差排序，取前30个
-                rule_based_opportunities.sort(
-                    key=lambda x: (x.get('volume_24h', 0) * abs(x.get('current_probability', 50) - 50)),
-                    reverse=True
-                )
-                top_opportunities = rule_based_opportunities[:30]
-                
-                analyzed_markets = self.batch_analyzer.batch_analyze_markets(
-                    top_opportunities,
-                    max_opportunities=30  # 只分析30个最有价值的机会
-                )
-            else:
-                logger.info("No rule-based opportunities found, skipping LLM analysis")
-                analyzed_markets = []
-            
-            # 3. 保存分析结果到数据库
-            if analyzed_markets:
-                self.batch_analyzer.save_batch_analysis(analyzed_markets)
-                analyzed_count = len(analyzed_markets)
-            else:
-                analyzed_count = 0
-            
-            elapsed = time.time() - start_time
-            logger.info(f"Polymarket update completed: {len(unique_markets)} markets updated, {analyzed_count} opportunities identified in {elapsed:.1f}s")
-            self._last_update_ts = time.time()
-            
+            self.run_once_analysis(save_to_db=True)
         except Exception as e:
             logger.error(f"Failed to update markets and analyze: {e}", exc_info=True)
     
@@ -184,5 +207,23 @@ def get_polymarket_worker() -> PolymarketWorker:
         return _polymarket_worker
 
 
-# 需要导入os
-import os
+
+def main() -> None:
+    """本地调试入口：仅执行一次 Polymarket 分析流程。"""
+    parser = argparse.ArgumentParser(description="Run one-shot Polymarket analysis")
+    parser.add_argument("--max-opportunities", type=int, default=30, help="Max opportunities to send to LLM")
+    parser.add_argument("--per-category-limit", type=int, default=50, help="Fetch limit per category")
+    parser.add_argument("--no-save", action="store_true", help="Do not save analysis result to DB")
+    args = parser.parse_args()
+
+    worker = PolymarketWorker()
+    summary = worker.run_once_analysis(
+        per_category_limit=args.per_category_limit,
+        max_opportunities=args.max_opportunities,
+        save_to_db=not args.no_save,
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
